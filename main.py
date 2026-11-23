@@ -6,6 +6,7 @@ import os
 import sys
 import traceback
 import psutil
+import win32api
 import win32gui
 import win32process
 
@@ -185,8 +186,12 @@ _user32.DisplayConfigGetDeviceInfo.argtypes = [ctypes.c_void_p]
 _user32.DisplayConfigGetDeviceInfo.restype = ctypes.c_long
 
 
-def get_primary_display_resolutions() -> tuple[int, int, int, int] | None:
-    """Возвращает (cur_w, cur_h, native_w, native_h) основного монитора."""
+_SCALING_CENTERED = 2                # картинка по центру без растяжения
+_SCALING_ASPECT = 4                  # растяжение с сохранением пропорций (чёрные полосы)
+
+
+def get_primary_display_resolutions() -> tuple[int, int, int, int, int] | None:
+    """Возвращает (cur_w, cur_h, native_w, native_h, scaling) основного монитора."""
     try:
         num_paths = ctypes.c_uint32()
         num_modes = ctypes.c_uint32()
@@ -231,7 +236,7 @@ def get_primary_display_resolutions() -> tuple[int, int, int, int] | None:
                 if path.targetInfo.rotation in (2, 4):
                     native_w, native_h = native_h, native_w
                 if cur_w > 0 and cur_h > 0:
-                    return (cur_w, cur_h, native_w, native_h)
+                    return (cur_w, cur_h, native_w, native_h, int(path.targetInfo.scaling))
     except Exception:
         pass
     return None
@@ -812,9 +817,13 @@ class CrosshairRenderer:
     def refresh_display_scale(cls) -> tuple[float, float]:
         res = get_primary_display_resolutions()
         if res is not None:
-            cur_w, cur_h, native_w, native_h = res
+            cur_w, cur_h, native_w, native_h, scaling = res
             sx = max(0.25, min(4.0, cur_w / native_w))
             sy = max(0.25, min(4.0, cur_h / native_h))
+            if scaling == _SCALING_CENTERED:
+                sx = sy = 1.0                       # монитор не растягивает картинку
+            elif scaling == _SCALING_ASPECT:
+                sx = sy = max(sx, sy)               # растяжение равномерное, по меньшей стороне
             cls._display_scale = (sx, sy)
             cls._display_scale_initialized = True
         return cls._display_scale
@@ -858,8 +867,17 @@ class CrosshairRenderer:
         cls._cached_path = ""
         cls._cached_mtime = 0.0
 
+    @staticmethod
+    def _snap(x: float, y: float, w: float, h: float) -> tuple[int, int, int, int]:
+        """Прямоугольник в дробных координатах -> целые пиксели (каждая грань округляется отдельно).
+        При центре на границе пикселей (чётный экран) чётная толщина ложится ровно по центру."""
+        x0, y0 = math.floor(x + 0.5), math.floor(y + 0.5)
+        x1, y1 = math.floor(x + w + 0.5), math.floor(y + h + 0.5)
+        return x0, y0, max(1, x1 - x0), max(1, y1 - y0)
+
     @classmethod
-    def draw(cls, painter: QPainter, cx: int, cy: int, cfg: dict, is_preview: bool = False):
+    def draw(cls, painter: QPainter, cx: float, cy: float, cfg: dict, is_preview: bool = False):
+        """cx, cy — точный геометрический центр (может быть на границе пикселей)."""
         painter.save()
 
         sx, sy = cls.get_effective_scale(cfg)
@@ -910,16 +928,15 @@ class CrosshairRenderer:
             thick_y = max(1, round(thick * sy))
             gap_x = round(gap * sx)
             gap_y = round(gap * sy)
-            half_tx = thick_x // 2
-            half_ty = thick_y // 2
 
-            rects = [
-                (cx - half_tx, cy + gap_y, thick_x, len_y),
-                (cx - gap_x - len_x, cy - half_ty, len_x, thick_y),
-                (cx + gap_x, cy - half_ty, len_x, thick_y),
+            frects = [
+                (cx - thick_x / 2, cy + gap_y, thick_x, len_y),
+                (cx - gap_x - len_x, cy - thick_y / 2, len_x, thick_y),
+                (cx + gap_x, cy - thick_y / 2, len_x, thick_y),
             ]
             if style == "classic":
-                rects.append((cx - half_tx, cy - gap_y - len_y, thick_x, len_y))
+                frects.append((cx - thick_x / 2, cy - gap_y - len_y, thick_x, len_y))
+            rects = [cls._snap(*r) for r in frects]
 
             painter.setPen(Qt.PenStyle.NoPen)
             if has_outline:
@@ -981,17 +998,13 @@ class CrosshairRenderer:
             d = cfg.get("dot_size", 2)
             dot_w = max(1, round(d * sx))
             dot_h = max(1, round(d * sy))
+            dx, dy, dw, dh = cls._snap(cx - dot_w / 2, cy - dot_h / 2, dot_w, dot_h)
             painter.setPen(Qt.PenStyle.NoPen)
             if has_outline:
                 painter.setBrush(QBrush(outline_color))
-                painter.drawRect(
-                    cx - dot_w // 2 - out_x,
-                    cy - dot_h // 2 - out_y,
-                    dot_w + out_x * 2,
-                    dot_h + out_y * 2
-                )
+                painter.drawRect(dx - out_x, dy - out_y, dw + out_x * 2, dh + out_y * 2)
             painter.setBrush(QBrush(base_color))
-            painter.drawRect(cx - dot_w // 2, cy - dot_h // 2, dot_w, dot_h)
+            painter.drawRect(dx, dy, dw, dh)
 
         painter.restore()
 
@@ -1012,8 +1025,11 @@ class CrosshairOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        # нечётный размер: центр попадает ровно на пиксель; запас под большие масштабы рисунка
-        self.overlay_size = 641
+        # запас под большие масштабы рисунка; точный центр хранится отдельно (дробный)
+        self.overlay_size = 640
+        self._center = (320.0, 320.0)
+        self._native_pos = (0, 0)
+        self._gc = (0.0, 0.0)
         self._last_screen_geom = None
         self._last_scale = None
         self._cache: QPixmap | None = None
@@ -1052,32 +1068,72 @@ class CrosshairOverlay(QWidget):
         self._cache = None
         self.update()
 
+    # Оверлей работает в ФИЗИЧЕСКИХ пикселях экрана, независимо от масштаба Windows (125%, 150%...):
+    # толщина 2 = ровно 2 пикселя, центр = точный центр монитора.
+
+    @staticmethod
+    def _monitor_rect() -> tuple[int, int, int, int]:
+        """Физический прямоугольник основного монитора (x, y, w, h)."""
+        try:
+            hmon = win32api.MonitorFromPoint((0, 0), 1)       # MONITOR_DEFAULTTOPRIMARY
+            l, t, r, b = win32api.GetMonitorInfo(hmon)["Monitor"]
+            return l, t, r - l, b - t
+        except Exception:
+            s = QApplication.primaryScreen()
+            g, d = s.geometry(), s.devicePixelRatio()
+            return round(g.x() * d), round(g.y() * d), round(g.width() * d), round(g.height() * d)
+
     def update_position(self):
-        primary = QApplication.primaryScreen()
-        if not primary:
-            return
-        screen = primary.geometry()
+        mx, my, mw, mh = self._monitor_rect()
         sx, sy = CrosshairRenderer.get_effective_scale(self.cfg)
-        self._last_screen_geom = screen
+        self._last_screen_geom = (mx, my, mw, mh, self.devicePixelRatioF())
         self._last_scale = (sx, sy)
-        x = screen.x() + (screen.width() - self.overlay_size) // 2 + round(self.cfg.get("offset_x", 0) * sx)
-        y = screen.y() + (screen.height() - self.overlay_size) // 2 + round(self.cfg.get("offset_y", 0) * sy)
-        self.setGeometry(x, y, self.overlay_size, self.overlay_size)
+        # точный центр: при чётном разрешении это граница между пикселями (1280.0 на 2560)
+        gcx = mx + mw / 2 + round(self.cfg.get("offset_x", 0) * sx)
+        gcy = my + mh / 2 + round(self.cfg.get("offset_y", 0) * sy)
+        half = self.overlay_size / 2
+        self._gc = (gcx, gcy)
+        # Qt хранит позицию в логических единицах и сам округляет её до физических пикселей
+        # (при 150% окно нельзя поставить в любой пиксель). Поэтому окно ставим примерно,
+        # а прицел внутри него сдвигаем так, чтобы он попал ровно в центр экрана.
+        dpr = self.devicePixelRatioF()
+        lx = math.floor((gcx - half) / dpr + 0.5)
+        ly = math.floor((gcy - half) / dpr + 0.5)
+        side = math.ceil(self.overlay_size / dpr) + 1
+        self.setGeometry(lx, ly, side, side)
+        self._set_origin(math.floor(lx * dpr + 0.5), math.floor(ly * dpr + 0.5))
+
+    def _set_origin(self, nx: int, ny: int):
+        """Физический левый-верхний угол окна -> центр прицела внутри окна."""
+        self._native_pos = (nx, ny)
+        self._center = (self._gc[0] - nx, self._gc[1] - ny)
         self.refresh()
+
+    def _sync_actual_pos(self):
+        """Сверка с реальной позицией окна: если Qt округлил иначе — перерисовать со сдвигом."""
+        try:
+            l, t, _r, _b = win32gui.GetWindowRect(int(self.winId()))
+        except Exception:
+            return
+        if (l, t) != self._native_pos:
+            self._set_origin(l, t)
+
+    def _raise_topmost(self):
+        try:
+            win32gui.SetWindowPos(int(self.winId()), _HWND_TOPMOST, 0, 0, 0, 0, _SWP_FLAGS)
+        except Exception:
+            pass
 
     def slow_tick(self):
         CrosshairRenderer.refresh_display_scale()
-        primary = QApplication.primaryScreen()
-        cur_geom = primary.geometry() if primary else None
-        if cur_geom != self._last_screen_geom or CrosshairRenderer._display_scale != self._last_scale:
+        cur = (*self._monitor_rect(), self.devicePixelRatioF())
+        if cur != self._last_screen_geom or CrosshairRenderer._display_scale != self._last_scale:
             self.update_position()
         self.check_target()
         # игры в borderless иногда перекрывают оверлей — тихо возвращаем его наверх
         if self.isVisible():
-            try:
-                win32gui.SetWindowPos(int(self.winId()), _HWND_TOPMOST, 0, 0, 0, 0, _SWP_FLAGS)
-            except Exception:
-                pass
+            self._sync_actual_pos()
+            self._raise_topmost()
 
     def _should_show(self) -> bool:
         if not self.cfg.get("enabled", True):
@@ -1092,18 +1148,18 @@ class CrosshairOverlay(QWidget):
         if show and not self.isVisible():
             self.show()
             self.raise_()
+            QTimer.singleShot(0, self._sync_actual_pos)
         elif not show and self.isVisible():
             self.hide()
 
     def _render(self) -> QPixmap:
-        dpr = self.devicePixelRatioF()
-        side = max(1, round(self.overlay_size * dpr))
-        pm = QPixmap(side, side)
-        pm.setDevicePixelRatio(dpr)
+        # рисуем 1:1 в физических пикселях, потом помечаем DPR — Qt выведет картинку без масштабирования
+        pm = QPixmap(self.overlay_size, self.overlay_size)
         pm.fill(Qt.GlobalColor.transparent)
         p = QPainter(pm)
-        CrosshairRenderer.draw(p, self.overlay_size // 2, self.overlay_size // 2, self.cfg, is_preview=False)
+        CrosshairRenderer.draw(p, self._center[0], self._center[1], self.cfg, is_preview=False)
         p.end()
+        pm.setDevicePixelRatio(self.devicePixelRatioF())
         return pm
 
     def paintEvent(self, event):
@@ -1134,7 +1190,12 @@ class PreviewWidget(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), self._bg)
 
-        CrosshairRenderer.draw(painter, self.width() // 2, self.height() // 2, self.cfg, is_preview=True)
+        # в физических пикселях, как и оверлей: превью совпадает с реальным прицелом при любом масштабе Windows
+        dpr = self.devicePixelRatioF()
+        painter.scale(1 / dpr, 1 / dpr)
+        cx = math.floor(self.width() * dpr / 2)
+        cy = math.floor(self.height() * dpr / 2)
+        CrosshairRenderer.draw(painter, cx, cy, self.cfg, is_preview=True)
 
 
 class SettingsWindow(QMainWindow):
@@ -1143,6 +1204,7 @@ class SettingsWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.cfg = self.load_config()
+        self.sliders: dict[str, tuple[QSlider, QLabel]] = {}
         self.overlay = CrosshairOverlay(self.cfg)
 
         # запись конфига откладывается: слайдер не пишет файл на каждый шаг
@@ -1170,6 +1232,19 @@ class SettingsWindow(QMainWindow):
                     data = json.load(f)
                     if isinstance(data, dict):
                         merged = {**DEFAULT_CONFIG, **data}
+                        # битые/чужие типы (например "length": "10") роняли окно при старте
+                        for k, v in DEFAULT_CONFIG.items():
+                            cur = merged.get(k)
+                            if isinstance(v, bool) or isinstance(cur, bool):
+                                ok = type(cur) is type(v)
+                            elif isinstance(v, (int, float)):
+                                ok = isinstance(cur, (int, float))
+                                if ok and isinstance(v, int):
+                                    merged[k] = int(cur)
+                            else:
+                                ok = isinstance(cur, type(v))
+                            if not ok:
+                                merged[k] = v
                         merged["drawn_path"] = DRAWN_IMAGE_FILE
                         merged.pop("stretch_x", None)  # параметр удалён, всегда авто
                         merged["config_version"] = 3
@@ -1180,8 +1255,11 @@ class SettingsWindow(QMainWindow):
 
     def save_config(self):
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            # атомарно: при сбое/выключении ПК во время записи старый конфиг не портится
+            tmp = CONFIG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.cfg, f, indent=4, ensure_ascii=False)
+            os.replace(tmp, CONFIG_FILE)
         except Exception as e:
             print("Ошибка сохранения конфига:", e)
 
@@ -1355,6 +1433,7 @@ class SettingsWindow(QMainWindow):
             self.update_cfg(key, val)
 
         slider.valueChanged.connect(on_change)
+        self.sliders[key] = (slider, val_lbl)
         row.addWidget(slider)
         row.addWidget(val_lbl)
         layout.addRow(label, row)
@@ -1448,11 +1527,37 @@ class SettingsWindow(QMainWindow):
         self.overlay.update_position()
 
     def reset_defaults(self):
+        """Сброс без перезапуска процесса (os.execl ломался на путях с пробелами
+        и оставлял «мёртвую» иконку в трее)."""
         self.cfg.clear()
         self.cfg.update(DEFAULT_CONFIG)
+
+        widgets = [self.cb_always_on, self.cb_enabled, self.cb_dot, self.cb_outline,
+                   self.style_combo, self.spin_x, self.spin_y]
+        widgets += [s for s, _ in self.sliders.values()]
+        for w in widgets:
+            w.blockSignals(True)
+        self.cb_always_on.setChecked(self.cfg["always_on"])
+        self.cb_enabled.setChecked(self.cfg["enabled"])
+        self.cb_dot.setChecked(self.cfg["dot"])
+        self.cb_outline.setChecked(self.cfg["outline"])
+        self.style_combo.setCurrentIndex(list(self.styles_map.keys()).index(self.cfg["style"]))
+        self.spin_x.setValue(self.cfg["offset_x"])
+        self.spin_y.setValue(self.cfg["offset_y"])
+        for key, (slider, lbl) in self.sliders.items():
+            slider.setValue(self.cfg[key])
+            lbl.setText(str(self.cfg[key]))
+        for w in widgets:
+            w.blockSignals(False)
+
+        self.update_color_btn()
+        self.refresh_process_list()
+        CrosshairRenderer.invalidate_cache()
+        self._save_timer.stop()
         self.save_config()
-        self.close()
-        os.execl(sys.executable, sys.executable, *sys.argv)
+        self.preview.update()
+        self.overlay.update_position()
+        self.overlay.check_target()
 
     def init_tray(self):
         pix = QPixmap(32, 32)
